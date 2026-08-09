@@ -1,0 +1,179 @@
+========================================================================
+                     MY CHESS RESNET AI - PROJECT DETAILS
+========================================================================
+
+Hello! You need this documentation if you intend to use this project to train your own AI model for chess (full customization) or for your own ideas.
+
+1. DATASET INFORMATION
+------------------------------------------------------------------------
+- Source: Lichess Open Database (https://database.lichess.org/)
+- File Used: lichess_db_standard_rated_2015-06.pgn
+- Target Elo Range: 1700 - 2100
+- Game Types: Blitz & Rapid
+- Minimum Game Length: 10 moves (short/abandoned games excluded)
+
+2. STEP-BY-STEP TRAINING PIPELINE
+------------------------------------------------------------------------
+1. Download Raw Data:
+   Download the PGN dataset (e.g., `lichess_db_standard_rated_2015-06.pgn`) 
+   from database.lichess.org (or another source) and place it in the project root folder.
+
+2. Filter Games (`filter_games.py`):
+   Runs filtering to select quality games within 1700-2100 Elo rating (or u can change it)
+   Outputs `filtered_1700_2100.pgn`.
+
+3. Prepare Feature Matrices (`prepare_data.py`):
+   Converts board states into 18x8x8 tensor representations (12 piece layers + 1 turn layer + 4 castling layers + 1 en passant layer)
+   and maps move strings to integer IDs.
+   Outputs:
+     - `X_chess_data.npy` (Board states)
+     - `Y_chess_data.npy` (Move target IDs)
+     - `move_to_id.npy`   (Vocabulary dictionary)
+
+4. Model Training (Google Colab):
+   Upload generated `.npy` files to Google Drive and execute the training script on GPU.
+   The model trains over 10 epochs using a ResNet architecture with memory-efficient
+   disk-mapped streaming (`mmap_mode='r'`).
+   Tip: If you have enough RAM (> 8 GB), drop `mmap_mode='r'` in `np.load` so the
+   data loads fully into memory - epochs run several times faster.
+   Outputs: `chess_resnet_model.pth`.
+
+5. Running the Engine (`uci_engine.py`):
+   The UCI engine loads the trained weights (`chess_resnet_model.pth`) and evaluates
+   top-candidate neural network moves. To ensure tactical safety, it uses Iterative
+   Deepening Minimax search (up to depth 3) with Alpha-Beta pruning, quiescence
+   search and MVV-LVA move ordering. Minimax acts as a blunder protector, not a
+   move picker: a candidate is vetoed only when it drops the evaluation by more
+   than 150 centipawns (1.5 pawns, `BLUNDER_THRESHOLD`) relative to the pre-move
+   position score; otherwise the most human move (highest NN probability) is played.
+   If every candidate blunders, the least-loss move is chosen instead. The static
+   evaluation uses classical Piece-Square Tables for positional awareness, and
+   opening variety comes from a weighted random pick among the top-3 safe moves
+   for the first 15 full moves.
+
+3. GOOGLE COLAB TRAINING SCRIPT
+------------------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+from google.colab import drive
+
+drive.mount('/content/drive')
+data_path = '/content/drive/MyDrive/ChessAi/'
+
+X_np = np.load(os.path.join(data_path, "X_chess_data.npy"), mmap_mode='r')
+Y_np = np.load(os.path.join(data_path, "Y_chess_data.npy"), mmap_mode='r')
+move_to_id = np.load(os.path.join(data_path, "move_to_id.npy"), allow_pickle=True).item()
+num_classes = len(move_to_id)
+
+print(f"Dataset loaded. Total positions: {len(X_np)}, Unique moves: {num_classes}")
+
+class FastChessDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = X
+        self.Y = Y
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x_arr = np.array(self.X[idx])
+        y_arr = np.array(self.Y[idx])
+        return torch.tensor(x_arr, dtype=torch.int8), torch.tensor(y_arr, dtype=torch.long)
+
+dataset = FastChessDataset(X_np, Y_np)
+dataloader = DataLoader(dataset, batch_size=1024, shuffle=True, num_workers=2, pin_memory=True)
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = F.relu(out)
+        return out
+
+class ChessResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(ChessResNet, self).__init__()
+        self.conv_initial = nn.Conv2d(18, 128, kernel_size=3, padding=1)
+        self.bn_initial = nn.BatchNorm2d(128)
+
+        self.res_blocks = nn.Sequential(*[ResBlock(128) for _ in range(8)])
+
+        self.fc1 = nn.Linear(128 * 8 * 8, 1024)
+        self.fc2 = nn.Linear(1024, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn_initial(self.conv_initial(x)))
+        x = self.res_blocks(x)
+
+        x = x.view(-1, 128 * 8 * 8)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Training device: {device}")
+
+model = ChessResNet(num_classes).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+epochs = 10
+print("Starting model training...")
+
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for i, data in enumerate(dataloader, 0):
+        inputs, labels = data
+        inputs = inputs.to(device, dtype=torch.float32)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+        if i % 500 == 499:
+            print(f"  [Epoch {epoch+1}, Batch {i+1}] Loss: {running_loss/500:.4f}")
+            running_loss = 0.0
+
+    accuracy = 100 * correct / total
+    print(f"Epoch {epoch+1} completed. Accuracy: {accuracy:.2f}%")
+
+    temp_save_path = os.path.join(data_path, f"chess_resnet_epoch_{epoch+1}.pth")
+    torch.save(model.state_dict(), temp_save_path)
+
+model_save_path = os.path.join(data_path, "chess_resnet_model.pth")
+torch.save(model.state_dict(), model_save_path)
+print(f"Training finished. Model saved to: {model_save_path}")
+
+========================================================================
+Notes
+========================================================================
+In the "Comparison" folder, the files lc0.exe, maia-1800.pb.gz, libopenblas.dll, and the other .dll files are required only to support Maia (for running arena.py and comparing against our AI model); these files are not needed for our AI and can be deleted.
+------------------------------------------------------------------------
+The model has been tested using the ARENA GUI; a `comparison` folder has also been created for matches between Maia (another AI model) and our AI. (also I built this AI in just two evenings, whereas a university team spent months working on Maia.) You can easily use this human-like AI—trained to play realistically at a 1900 Elo level—as a base to create your own version
